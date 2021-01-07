@@ -1,0 +1,468 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import yfinance as yf
+import pandas as pd
+from scipy.stats import norm
+from scipy.signal import find_peaks
+from tqdm import tqdm
+from string import ascii_uppercase
+from datetime import timedelta as td
+from datetime import datetime
+from Indicators import Indicators
+from time import perf_counter
+
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', None)
+
+filepath = '/Users/alejandroacosta/Documents/Programming/PyQuant Reports/'
+
+
+def plot_2axs(series1, series2):
+
+    fig, axs1 = plt.subplots()
+    axs1.plot(series1, color='tab:blue')
+
+    axs2 = axs1.twinx()
+    axs2.plot(series2, color='tab:red')
+
+    plt.show()
+
+
+def format_date(*args):
+
+    with pd.option_context('mode.chained_assignment', None):
+        for arg in args:
+            for i in range(len(arg)):
+                arg.iloc[i] = arg.iloc[i].strftime('%b-%d-%Y %I:%M %p')
+
+
+class Historicals(object):
+
+    def __init__(self, symbol, period, interval):
+
+        self.symbol = symbol
+        self.interval = interval
+
+        # valid periods: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+        # valid intervals: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
+
+        ticker = yf.Ticker(self.symbol)
+        self.history = ticker.history(period=period, interval=interval).reset_index()
+        self.history.rename(columns={'Datetime': 'Date'}, inplace=True)
+
+        self.avg_vol = self.history['Volume'].mean()
+        self.returns = self.history['Close'].diff()
+        self.cum_returns = self.history['Close'] - self.history['Close'].iloc[0]
+
+        close = self.history['Close']
+        log = np.log(close) - np.log(close.shift(1))
+        st = log.dropna().ewm(span=252).std()
+        self.volatility = st.iloc[-1]
+
+        self.buy_and_hold = close.iloc[-1] - close.iloc[0]
+
+
+class Quant(object):
+
+    def __init__(self, historicals, strat_name, available_funds=5000, overwrite=False):
+
+        self.strat_name = strat_name
+        self.overwrite = overwrite
+        self.historicals = historicals
+        self.indicators = Indicators(historicals.history)
+        self.close = historicals.history['Close']
+        self.date = historicals.history['Date'].dt.tz_localize(None)
+
+        self.available_funds = available_funds
+        self.orders = list()
+        self.trades = list()
+
+        self.change_in_shares, self.shares_owned = 0, 0
+        self.metrics = {i: list() for i in ['Shares Owned', 'Change in Shares', 'Balance', 'Available Funds']}
+
+    def crossover(self, x, y):
+
+        if not isinstance(x, pd.Series):
+            x = pd.Series([x for _ in range(len(y))])
+        elif not isinstance(y, pd.Series):
+            y = pd.Series([y for _ in range(len(x))])
+
+        return pd.DataFrame({0: x > y, 1: x.shift() <= y.shift()}).all(axis=1)
+
+    def performance(self):
+
+        winners = self.trades[self.trades['Profit'] > 0]['Profit']
+        losers = self.trades[self.trades['Profit'] <= 0]['Profit']
+
+        gross_profit = winners.sum()
+        gross_loss = losers.sum()
+        nbr_of_trades = winners.count() + losers.count()
+        profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else np.NaN
+
+        try:
+            avg_days_held = round(self.trades['Days Held'].mean())
+        except ValueError:
+            avg_days_held = np.NaN
+
+        if nbr_of_trades != 0:
+            win_rate = round(winners.count() / nbr_of_trades * 100)
+        else:
+            win_rate = np.NaN
+
+        # sharpe = self.returns.mean() / self.returns.std()
+        # sortino = self.returns.mean() / np.sqrt(self.returns.apply(lambda x: x ** 2 if x < 0 else 0)).mean()
+
+        report = pd.DataFrame({'Ticker': self.historicals.symbol,
+                             'Strategy': self.strat_name,
+                             'Buy and Hold': round(self.historicals.buy_and_hold, 2),
+                             'Volatility': round(self.historicals.volatility, 2),
+                             'Avg Volume (M)': round(self.historicals.avg_vol / 1000000, 2),
+                             'Average Days Held': avg_days_held,
+                             'Gross Profit': round(gross_profit, 2),
+                             'Gross Loss': round(gross_loss, 2),
+                             'Net PnL': round(gross_profit + gross_loss, 2),
+                             'Profit Factor': round(profit_factor, 2),
+                             'Maximum Drawdown (%)': round(self.metrics['Drawdown'].min() * 100, 2),
+                             'Total Closed Trades': nbr_of_trades,
+                             'Win Rate (%)': win_rate,
+                             '# of Winning Trades': winners.count(),
+                             '# of Losing Trades': winners.count(),
+                             'Average Win': round(winners.mean(), 2),
+                             'Largest Win': round(winners.max(), 2),
+                             'Average Loss': round(losers.mean(), 2),
+                             'Largest Loss': round(losers.min(), 2)}, index=[0])
+
+        if self.overwrite:
+            report.to_csv(filepath + 'Summary.csv')
+
+        return report
+
+    def reset(self):
+        self.__init__(self.historicals, self.strat_name, self.available_funds)
+
+    def run_strategy(self):
+
+        def calc_postrun_metrics():
+
+            balance = pd.Series(self.metrics['Balance'])
+
+            self.metrics['Returns'] = balance.diff()
+            self.metrics['Pct Change'] = balance.pct_change()
+            self.metrics['Cumulative Returns'] = self.metrics['Returns'].cumsum()
+            self.metrics['Running Pct Change'] = pd.Series([(balance.iloc[i] - balance.iloc[0]) / balance.iloc[0]
+                                                            for i in range(len(balance))])
+            self.metrics['Benchmark Cumulative Returns'] = self.historicals.cum_returns
+            self.metrics['Drawdown'] = (balance - balance.cummax()) / balance.cummax()
+            self.metrics['Log Returns'] = np.log(balance).diff()
+
+            self.metrics = pd.DataFrame(self.metrics)
+            self.trades = pd.DataFrame(self.trades,
+                                       columns=['Type', 'Position', 'Option', 'Expiration', 'Open', 'Close',
+                                                'Qty', 'Profit', '% G/L', 'Open Date', 'Close Date',
+                                                'Days Held'])
+
+            self.metrics = pd.concat([self.historicals.history, self.metrics], axis=1)
+
+            return self.metrics, self.trades
+
+        if self.strat_name == 'SMA Crossover':
+
+            slow_sma = self.indicators.sma(self.close, length=50)
+            fast_sma = self.indicators.sma(self.close, length=20)
+
+            long_when = self.crossover(fast_sma, slow_sma)
+            short_when = self.crossover(slow_sma, fast_sma)
+
+        else:
+
+            _, _, macd_hist = self.indicators.macd(self.close, fast_length=24, slow_length=42)
+
+            long_when = self.crossover(macd_hist, 0)
+            short_when = self.crossover(0, macd_hist)
+
+        for idx in range(len(self.close)):
+
+            global current_close
+            global current_date
+            global sigma
+
+            current_close = self.close.iloc[idx]
+            current_date = self.date.iloc[idx]
+            sigma = self.historicals.volatility
+
+            def entry(qty, when=True, long=True, qty_type='fixed', limit=0, stop=0, use_strike=0):
+
+                p = current_close if use_strike == 0 else use_strike
+
+                if not np.isnan(p) and when:
+
+                    # qty_type affects how the default_qty_val is used
+                    #       if type = 'fixed', the value in the variable qty represents # of shares
+                    #       if type = 'cash', the value in the variable qty represents $
+                    #       if type = 'pct_of_equity', the value in the variable qty represents a % of whatever capital the strategy has at the time
+                    #       if type = 'target', the value in the variable qty represents the # of shares you ultimately want to own, regardless of the number of shares currently owned
+
+                    if qty_type == 'cash':
+                        shares = int(qty // p)
+                    elif qty_type == 'pct_of_equity':
+                        shares = int((self.available_funds * (float(qty) / 100)) // p)
+                    elif qty_type == 'target':
+                        shares = int(qty - self.shares_owned)
+                        long = False if shares < 0 else True
+                        shares = abs(shares)
+                    else:
+                        shares = int(qty)
+
+                    order = Stock(shares, long=long, limit=limit, stop=stop)
+
+                    if order.qty != 0 and sufficient_funds(order):
+                        self.orders.append(order)
+
+            def entry_option(strike, months_to_exp=0, days_to_exp=0, expiration=None, qty=100, is_call=True, write=False):
+
+                option = Option(strike, months_to_exp=months_to_exp, days_to_exp=days_to_exp, expiration=expiration,
+                                qty=qty, is_call=is_call, write=write)
+
+                if sufficient_funds(option):
+                    self.orders.append(option)
+                    self.available_funds -= option.value
+
+            def sufficient_funds(order):
+
+                try:
+                    funds_needed = order.value
+                except AttributeError:
+                    funds_needed = order.qty * current_close
+
+                return self.available_funds - funds_needed >= 0
+
+            def process_orders():
+
+                for order in self.orders:
+
+                    try:
+                        if order.fill_order():
+                            self.change_in_shares += (order.qty if order.long else -order.qty)
+                    except AttributeError:
+                        pass
+
+                    for prev_order in self.orders:
+                        if order != prev_order and order.qty != 0 and prev_order.qty != 0:
+                            trade = order.reduce_position_size(prev_order)
+
+                            if trade:
+                                self.trades.append(trade)
+
+                for order in self.orders:
+                    if order.qty == 0:
+                        self.orders.remove(order)
+
+            def refresh():
+
+                process_orders()
+                self.shares_owned += self.change_in_shares
+                self.available_funds -= self.change_in_shares * current_close if not np.isnan(
+                    current_close) else 0
+
+                total_option_vals = list()
+
+                for order in self.orders:
+                    try:
+                        if current_date <= order.expiration:
+                            total_option_vals.append(order.value)
+                            order.calc_premium()
+                    except AttributeError:
+                        pass
+
+                self.metrics['Change in Shares'].append(self.change_in_shares)
+                self.metrics['Shares Owned'].append(self.shares_owned)
+                self.metrics['Balance'].append(
+                    self.available_funds + (self.shares_owned * current_close) + sum(total_option_vals))
+                self.metrics['Available Funds'].append(self.available_funds)
+
+                self.change_in_shares = 0
+
+            class Stock(object):
+
+                def __init__(self, qty, long=True, limit=0, stop=0):
+                    self.stop = stop
+                    self.limit = limit
+                    self.long = long
+                    self.qty = qty
+                    self.filled = False
+                    self.date = current_date
+                    self.price = current_close
+
+                # Checks to see if stop/limit requirements have been met. If so, the order is filled and returns True
+                def fill_order(self):
+
+                    criteria_met = False
+
+                    if self.long:
+                        if self.limit != 0 and self.stop == 0:
+                            # if it is a limit order, price must be below limit to be converted to market order
+                            if current_close <= self.limit:
+                                criteria_met = True
+                        elif self.limit == 0 and self.stop != 0:
+                            # if it is a stop order, price must reach stop to be converted to market order
+                            if current_close >= self.stop:
+                                criteria_met = True
+                        elif self.limit != 0 and self.stop != 0:
+                            # if it is a stop-limit order, price must reach stop and be below limit to be converted to market order
+                            if self.limit >= current_close >= self.stop:
+                                criteria_met = True
+                        else:
+                            criteria_met = True
+                    else:
+                        if self.limit != 0 and self.stop == 0:
+                            # if it is a limit order, price must be below limit to be converted to market order
+                            if current_close >= self.limit:
+                                criteria_met = True
+                        elif self.limit == 0 and self.stop != 0:
+                            # if it is a stop order, price must reach stop to be converted to market order
+                            if current_close <= self.stop:
+                                criteria_met = True
+                        elif self.limit != 0 and self.stop != 0:
+                            # if it is a stop-limit order, price must reach stop and be below limit to be converted to market order
+                            if self.stop >= current_close >= self.limit:
+                                criteria_met = True
+                        else:
+                            criteria_met = True
+
+                    if criteria_met and self.filled is False:
+                        self.filled = True
+                        self.date = current_date
+                        self.price = current_close
+                        return True
+                    else:
+                        return False
+
+                # Checks to see if the current order is in the opposite direction to the previous order
+                # If so, logs the completed trade and reduces the quantities of both orders, leaving any excess with self
+                def reduce_position_size(self, prev_order):
+
+                    if prev_order.filled and self.long != prev_order.long:
+                        shares = min(self.qty, prev_order.qty)
+                        excess = self.qty - shares
+                        net = (self.price - prev_order.price) * shares * (1 if prev_order.long else -1)
+
+                        trade = {'Type': 'Equity',
+                                 'Position': 'Long' if prev_order.long else 'Short',
+                                 'Option': np.NaN,
+                                 'Expiration': np.NaN,
+                                 'Open': prev_order.price,
+                                 'Close': self.price,
+                                 'Qty': shares,
+                                 'Profit': net,
+                                 '% G/L': net / (prev_order.price * shares),
+                                 'Open Date': prev_order.date,
+                                 'Close Date': self.date,
+                                 'Days Held': (self.date - prev_order.date).days}
+
+                        prev_order.qty -= shares
+                        self.qty = excess
+
+                        return trade
+
+            class Option(object):
+
+                def __init__(self, strike, months_to_exp=0, days_to_exp=0, expiration=None,
+                             qty=100, is_call=True, write=False, r=0.00307):
+
+                    self.r = r
+                    self.date = current_date
+                    self.write = write
+                    self.qty = qty
+                    self.is_call = is_call
+
+                    def find_valid_expiration():
+                        d = datetime(current_date.year, current_date.month + months_to_exp, current_date.day + days_to_exp)
+
+                        while d.weekday() != 4 or not (d == current_date).any():
+                            if not (d + td(1) == current_date).any() and (d + td(1)).weekday() == 4:
+                                break
+                            d += td(1)
+                        d = d.replace(hour=15, minute=30)
+
+                        return d
+
+                    self.expiration = find_valid_expiration() if expiration is None else expiration
+                    self.share_price = current_close
+                    self.strike = strike
+
+                    self.premium, self.value = 0., 0.
+                    self.calc_premium()
+                    self.init_premium = self.premium
+
+                # Calculates total value = premium * qty
+                def value(self):
+                    return self.premium * self.qty * (-1 if self.write else 1)
+
+                # Checks to see if the current order is in the opposite direction to the previous order
+                # If so, logs the completed trade and reduces the quantities of both orders, leaving any excess with self
+                def reduce_position_size(self, prev_order):
+
+                    if self.write != prev_order.write and self.expiration == prev_order.expiration and \
+                            self.strike == prev_order.strike and self.is_call == prev_order.is_call and self != prev_order \
+                            and self.qty != 0 and prev_order.qty != 0:
+                        shares = min(self.qty, prev_order.qty)
+                        excess = self.qty - shares
+
+                        open_price = prev_order.init_premium
+                        close_price = self.premium
+                        net = (close_price - open_price) * shares * (-1 if prev_order.write else 1)
+
+                        trade = {'Type': 'Derivative',
+                                 'Position': 'Short' if prev_order.write else 'Long',
+                                 'Option': 'Call' if prev_order.is_call else 'Put',
+                                 'Expiration': self.expiration,
+                                 'Open': open_price,
+                                 'Close': close_price,
+                                 'Qty': shares,
+                                 'Profit': net,
+                                 '% G/L': (net / (open_price * shares)) * 100,
+                                 'Open Date': prev_order.date,
+                                 'Close Date': self.date,
+                                 'Days Held': (self.date - prev_order.date).days}
+
+                        prev_order.qty -= shares
+                        self.qty = excess
+
+                        return trade
+
+                # Recalculates premium using the Black-Scholes model
+                def calc_premium(self):
+
+                    t = (self.expiration - current_date).total_seconds() / (365 * 86400)
+
+                    def d1():
+                        numerator = np.log(current_close / self.strike) + (self.r + (sigma ** 2 / 2)) * t
+                        if t != 0:
+                            return numerator / (sigma * np.sqrt(t))
+                        else:
+                            return 0
+
+                    def d2():
+                        return d1() - sigma * np.sqrt(t)
+
+                    get = current_close * norm.cdf(d1() * (1 if self.is_call else -1))
+                    pay = self.strike * (np.e ** (-self.r * t)) * norm.cdf(d2() * (1 if self.is_call else -1))
+
+                    self.premium = (get - pay) if self.is_call else (pay - get)
+                    self.value = self.value()
+
+            entry(10, when=long_when.iloc[idx], qty_type='pct_of_equity')
+            entry(0, when=short_when.iloc[idx], qty_type='target', long=False)
+
+            refresh()
+
+        return calc_postrun_metrics()
+
+
+start = perf_counter()
+hist = Historicals('MSFT', period='1y', interval='60m')
+quant = Quant(hist, 'SMA Crossover')
+quant.run_strategy()
+print(perf_counter() - start)
+quant.performance()
