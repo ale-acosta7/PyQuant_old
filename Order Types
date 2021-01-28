@@ -1,0 +1,156 @@
+class Order(object):
+
+    def __init__(self, row, qty, long):
+        self.row = row
+        self.qty = qty
+        self.long = long
+        self.date = row['Date']
+        self.price = row['Close']
+        self.value_per_unit_of_qty = row['Close']
+        self.option_type = None
+        self.expiration = np.datetime64('NaT')
+
+    def is_valid_trade_pair(self, prev_order):
+        return True
+
+    def scale_back_position(self, prev_order):
+
+        if self.is_valid_trade_pair(prev_order):
+            shares = min(self.qty, prev_order.qty)
+            excess = self.qty - shares
+
+            trade = {'Type': self.__class__.__name__,
+                     'Position': 'Long' if prev_order.long else 'Short',
+                     'Option': self.option_type,
+                     'Expiration': self.expiration,
+                     'Open': prev_order.price,
+                     'Close': self.price,
+                     'Qty': shares,
+                     'Open Date': prev_order.date,
+                     'Close Date': self.date,
+                     'Days Held': (self.date - prev_order.date).days}
+
+            prev_order.qty -= shares
+            self.qty = excess
+
+            return trade
+
+    def sufficient_funds(self, available_funds):
+        return available_funds - self.value() >= 0
+
+    def value(self):
+        return ((self.value_per_unit_of_qty - self.price) * (self.qty if self.long else -self.qty)) + self.price
+
+
+class Stock(Order):
+
+    def __init__(self, row, qty, long=True, limit=0, stop=0, strike=0):
+
+        self.stop = stop
+        self.limit = limit
+        self.filled = True if (limit == 0 and stop == 0) else False
+        super(Stock, self).__init__(row, qty, long)
+        if strike > 0:
+            self.price = strike
+            self.value_per_unit_of_qty = self.price
+
+    # Checks to see if stop/limit requirements have been met. If so, the order is filled and returns True
+    def fill_order(self, row):
+
+        criteria_met = False
+        p = row['Close']
+
+        if self.filled is False:
+
+            if self.long:
+
+                if self.limit != 0 and self.stop == 0:
+                    # if it is a limit order, price must be below limit to be converted to market order
+                    if p <= self.limit:
+                        criteria_met = True
+                elif self.limit == 0 and self.stop != 0:
+                    # if it is a stop order, price must reach stop to be converted to market order
+                    if p >= self.stop:
+                        criteria_met = True
+                elif self.limit != 0 and self.stop != 0:
+                    # if it is a stop-limit order, price must reach stop and be below limit to be converted to market order
+                    if self.limit >= p >= self.stop:
+                        criteria_met = True
+                else:
+                    criteria_met = True
+
+            else:
+
+                if self.limit != 0 and self.stop == 0:
+                    # if it is a limit order, price must be below limit to be converted to market order
+                    if p >= self.limit:
+                        criteria_met = True
+                elif self.limit == 0 and self.stop != 0:
+                    # if it is a stop order, price must reach stop to be converted to market order
+                    if p <= self.stop:
+                        criteria_met = True
+                elif self.limit != 0 and self.stop != 0:
+                    # if it is a stop-limit order, price must reach stop and be below limit to be converted to market order
+                    if self.stop >= p >= self.limit:
+                        criteria_met = True
+                else:
+                    criteria_met = True
+
+            if criteria_met:
+                self.filled = True
+                self.date = row['Date']
+                self.price = row['Close']
+                return True
+
+            else:
+                return False
+
+        else:
+            return False
+
+    def is_valid_trade_pair(self, prev_order):
+        return self.filled and prev_order.filled
+
+
+class Option(Order):
+
+    def __init__(self, row, strike, sigma, expiration, qty=100, long=True, is_call=True, r=0.00307):
+
+        super(Option, self).__init__(row, qty, long)
+        self.is_call = is_call
+        self.strike = strike
+        self.r = r
+        self.sigma = sigma
+        self.expiration = expiration
+        self.option_type = 'Call' if is_call else 'Put'
+
+        self.value_per_unit_of_qty = 0.
+        self.calc_premium(row)
+        self.price = self.value_per_unit_of_qty
+        self.breakeven = strike + (self.price if is_call else -self.price)
+
+    def calc_premium(self, row):
+
+        share_price = row['Close']
+        date = row['Date']
+
+        t = (self.expiration - date).total_seconds() / (365 * 86400)
+
+        def d1():
+            numerator = np.log(share_price / self.strike) + (self.r + (self.sigma ** 2 / 2)) * t
+            if t != 0:
+                return numerator / (self.sigma * np.sqrt(t))
+            else:
+                return 0
+
+        def d2():
+            return d1() - self.sigma * np.sqrt(t)
+
+        get = share_price * norm.cdf(d1() * (1 if self.is_call else -1))
+        pay = self.strike * (np.e ** (-self.r * t)) * norm.cdf(d2() * (1 if self.is_call else -1))
+
+        self.value_per_unit_of_qty = (get - pay) if self.is_call else (pay - get)
+
+    def is_valid_trade_pair(self, prev_order):
+        return self.expiration == prev_order.expiration and self.strike == prev_order.strike and \
+               self.is_call == prev_order.is_call
