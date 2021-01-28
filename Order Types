@@ -1,3 +1,6 @@
+import numpy as np
+from scipy.stats import norm
+
 class Order(object):
 
     def __init__(self, row, qty, long):
