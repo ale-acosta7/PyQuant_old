@@ -1,0 +1,76 @@
+from Backtester import Quant, Historicals
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+class SMA_Crossover(Quant):
+
+    def __init__(self, historicals, initial_capital=5000):
+
+        super(SMA_Crossover, self).__init__(historicals, initial_capital)
+
+        fast_sma = self.indicators.sma(self.history['Close'], length=20)
+        slow_sma = self.indicators.sma(self.history['Close'], length=50)
+        self.long_when, self.short_when = self.crossover(fast_sma, slow_sma), self.crossover(slow_sma, fast_sma)
+
+    def strategy(self, idx):
+
+        self.entry(0, when=self.long_when.iloc[idx], qty_type='target')
+        self.entry(0, when=self.short_when.iloc[idx], qty_type='target')
+
+        self.entry(10, when=self.long_when.iloc[idx], qty_type='pct_of_equity', long=True)
+        self.entry(10, when=self.short_when.iloc[idx], qty_type='pct_of_equity', long=False)
+
+
+class MACD(Quant):
+
+    def __init__(self, historicals, initial_capital=5000):
+
+        super(MACD, self).__init__(historicals, initial_capital)
+
+        _, _, hist = self.indicators.macd(self.history['Close'])
+        self.long_when, self.short_when = self.crossover(hist, 0), self.crossover(0, hist)
+
+    def strategy(self, idx):
+
+        self.entry(1, when=self.long_when.iloc[idx], qty_type='target', long=True)
+        self.entry(-1, when=self.short_when.iloc[idx], qty_type='target', long=False)
+
+
+class Ichimoku(Quant):
+
+    def __init__(self, historicals, initial_capital=5000):
+
+        super(Ichimoku, self).__init__(historicals, initial_capital)
+
+        close = self.history['Close']
+        self.displ = 26
+        conversion, base, lead1, lead2, lagging = self.indicators.ichimoku(displ=self.displ)
+        sma_200 = self.indicators.sma(close, length=200)
+
+        bull_cloud = lead1 > lead2
+        price_abv_cloud, price_blw_cloud = close > np.maximum(lead1, lead2), close < np.minimum(lead1, lead2)
+        self.conv_abv_base, self.conv_blw_base = conversion > base, conversion <= base
+        price_abv_sma = close > sma_200
+
+        self.lag_abv_price = lagging > close
+        self.long_when = bull_cloud & price_abv_sma & price_abv_cloud & self.conv_abv_base
+        self.short_when = ~bull_cloud & ~price_abv_sma & price_blw_cloud & self.conv_blw_base
+
+    def strategy(self, idx):
+
+        lag_abv_price = self.lag_abv_price.iloc[max(idx - self.displ, 0)]
+
+        if self.shares_owned != 0:
+            if (self.shares_owned > 0 and self.conv_blw_base.iloc[idx] and not lag_abv_price) or \
+                    (self.shares_owned < 0 and self.conv_abv_base.iloc[idx] and lag_abv_price):
+                self.entry(0, qty_type='target')
+        else:
+            self.entry(10, when=(self.long_when.iloc[idx] and lag_abv_price), qty_type='pct_of_equity', long=True)
+            self.entry(10, when=(self.short_when.iloc[idx] and not lag_abv_price), qty_type='pct_of_equity', long=False)
+
+
+sma_crossover = SMA_Crossover(Historicals('CSCO', period='2y'))
+sma_crossover.run_backtest()
+sma_crossover.plot_charts()
+plt.show()
