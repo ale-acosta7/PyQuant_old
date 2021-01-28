@@ -1,0 +1,380 @@
+import pandas as pd
+import numpy as np
+
+
+class Indicators(object):
+
+    def __init__(self, history):
+        self.history = history
+        self.date = history['Date']
+        self.high = history['High']
+        self.low = history['Low']
+        self.open = history['Open']
+        self.close = history['Close']
+        self.volume = history['Volume']
+
+    def cross(self, x, y, over=True):
+
+        def shift(var):
+            try:
+                return var.shift()
+            except AttributeError:
+                return var
+
+        foo = x > y if over else x < y
+        bar = shift(x) <= shift(y) if over else shift(x) >= shift(y)
+
+        return pd.DataFrame({'col1': foo, 'col2': bar}).all(axis=1)
+
+    def over_under(self, series, x, length=1, over=True):
+
+        def list_comp(j, n):
+            return [j for _ in range(n)]
+
+        x = pd.Series(list_comp(x, len(series))) if not isinstance(x, pd.Series) else x
+        output = list_comp(np.NaN, length - 1) if length > 0 else list()
+
+        for i in range(len(output), len(series)):
+            if all([series.iloc[i - j] > x.iloc[i - j] for j in range(length)]):
+                output.append(True if over else False)
+            else:
+                output.append(False if over else True)
+
+        return pd.Series(output).fillna(False)
+
+    # TREND indicators
+
+    def sma(self, series, length=20):
+        # calculate simple moving average
+        return series.rolling(window=length).mean()
+
+    def ema(self, series, length=20):
+        # calculate exponential moving average
+        return series.ewm(span=length, adjust=False).mean()
+
+    def parabolic_sar(self, accel=0.02, max_val=0.2):
+        length = len(self.close)
+        high = list(self.high)
+        low = list(self.low)
+        close = list(self.close)
+
+        psar = close[0:length]
+        bull = True
+        af = accel
+        hp = high[0]
+        lp = low[0]
+
+        for i in range(1, length):
+            if bull:
+                psar[i] = psar[i - 1] + af * (hp - psar[i - 1])
+            else:
+                psar[i] = psar[i - 1] + af * (lp - psar[i - 1])
+
+            reverse = False
+
+            if bull:
+                if low[i] < psar[i]:
+                    bull = False
+                    reverse = True
+                    psar[i] = hp
+                    lp = low[i]
+                    af = accel
+            else:
+                if high[i] > psar[i]:
+                    bull = True
+                    reverse = True
+                    psar[i] = lp
+                    hp = high[i]
+                    af = accel
+
+            if not reverse:
+                if bull:
+                    if high[i] > hp:
+                        hp = high[i]
+                        af = min(af + accel, max_val)
+                    if low[i - 1] < psar[i]:
+                        psar[i] = low[i - 1]
+                    if low[i - 2] < psar[i]:
+                        psar[i] = low[i - 2]
+                else:
+                    if low[i] < lp:
+                        lp = low[i]
+                        af = min(af + accel, max_val)
+                    if high[i - 1] > psar[i]:
+                        psar[i] = high[i - 1]
+                    if high[i - 2] > psar[i]:
+                        psar[i] = high[i - 2]
+
+        return pd.Series(psar)
+
+    def ichimoku(self, conversion_period=9, base_period=26, lagging_periods=52, displ=26):
+
+        def donchian(period):
+            return (self.high.rolling(window=period).max() + self.low.rolling(window=period).min()) / 2
+
+        conversion = donchian(conversion_period)
+        base = donchian(base_period)
+        lead1 = ((conversion + base) / 2).shift(displ)
+        lead2 = donchian(lagging_periods).shift(displ)
+        lagging = self.close.shift(-1 * displ)
+
+        return conversion, base, lead1, lead2, lagging
+
+    def linreg(self, series, length=20, return_slope=False):
+
+        x = pd.Series(series.index)
+        y = series
+        x_ = x.rolling(window=length).mean()
+        y_ = y.rolling(window=length).mean()
+        mx = x.rolling(window=length).std()
+        my = y.rolling(window=length).std()
+        c = x.rolling(window=length).corr(y)
+
+        slope = c * (my / mx)
+        inter = y_ - slope * x_
+
+        if return_slope:
+            reg = pd.Series([slope.iloc[i] for i in range(len(x))])
+            reg = reg.multiply(100) / series
+        else:
+            reg = pd.Series([(i * slope.iloc[i] + inter.iloc[i]) for i in range(len(x))])
+
+        return reg
+
+    def hlc3(self):
+        # average of high, low, and close
+        return (self.high + self.low + self.close) / 3
+
+    # MOMENTUM indicators
+
+    def macd(self, series, fast_length=12, slow_length=26, smoothing=9):
+        # calculate Moving Average Convergence / Divergence
+        fast_ma = self.ema(series, length=fast_length)
+        slow_ma = self.ema(series, length=slow_length)
+
+        macd = fast_ma - slow_ma
+        signal = self.ema(macd, length=smoothing)
+        hist = macd - signal
+
+        return macd, signal, hist
+
+    def rsi(self, series, length=14):
+        # calculate Relative Strength Index (RSI) - leading indicator
+        # find change from one tick to the next
+        delta = series.diff()
+
+        # create duplicates two duplicates of delta, and keep positive values in 'gain' and negative values in 'loss'
+        gain, loss = delta.copy(), delta.copy()
+        gain[gain < 0] = 0
+        loss[loss >= 0] = 0
+
+        # apply EMA to gain and loss
+        avg_gain = self.ema(gain, length=length)
+        avg_loss = self.ema(loss, length=length).abs()
+
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    # needs some more fine tuning, smoothing is off
+    def adx(self, adx_smooth=25, di_len=14):
+
+        up = self.high.diff()
+        down = -self.low.diff()
+
+        plusDM = up.where((up > down) & (up > 0), 0).ewm(alpha=1.0 / di_len, adjust=False).mean()
+        minusDM = down.where((down > up) & (down > 0), 0).ewm(alpha=1.0 / di_len, adjust=False).mean()
+
+        df = pd.DataFrame({'H-L': self.high - self.low, 'H-PC': abs(self.high - self.close.shift()),
+                           'L-PC': abs(self.low - self.close.shift())})
+        true_range = df.max(axis=1, skipna=False).ewm(alpha=1.0 / di_len, adjust=False).mean()
+
+        pdi = (plusDM / true_range) * 100
+        ndi = (minusDM / true_range) * 100
+
+        sums = pdi + ndi
+        return self.ema(abs(pdi - ndi) / sums.where(sums != 0, 1), length=adx_smooth) * 100
+
+    def stoch(self, period_k=14, period_d=3, smoothing=3):
+        # calculate Stochastics - leading indicator
+        low_low = self.low.rolling(window=period_k).min()
+        high_high = self.high.rolling(window=period_k).max()
+
+        k = (((self.close - low_low) * 100) / (high_high - low_low))
+        k = self.sma(k, length=smoothing)
+        d = self.sma(k, length=period_d)
+
+        return k, d
+
+    def tsi(self, series, long_length=25, short_length=13, signal_length=13):
+        # calculate true strength index
+
+        price_delta = series.diff()
+
+        double_smoothed_pc = self.ema(self.ema(price_delta, length=long_length), length=short_length)
+        double_smoothed_abs_pc = self.ema(self.ema(price_delta.apply(abs), length=long_length), length=short_length)
+
+        tsi = 100 * (double_smoothed_pc / double_smoothed_abs_pc)
+        signal = self.ema(tsi, length=signal_length)
+        hist = tsi - signal
+
+        return tsi, signal, hist
+
+    def cci(self, length=20):
+        tp = self.hlc3()
+        return pd.Series((tp - self.sma(tp, length=length)) / (0.015 * tp.rolling(window=length).std()))
+
+    def ao(self):
+        # calculate Awesome Oscillato
+        return self.sma((self.high + self.low) / 2, length=5) - self.sma((self.high + self.low) / 2, length=34)
+
+    def squeeze_momentum(self, length=20):
+
+        hh = self.high.rolling(window=length).max()
+        ll = self.low.rolling(window=length).min()
+
+        x = pd.DataFrame({'HH': hh, 'LL': ll}).mean(axis=1, skipna=False)
+        y = pd.DataFrame({'X': x, 'C': self.sma(self.close, length=length)}).mean(axis=1, skipna=False)
+
+        return self.linreg(self.close - y, length)
+
+    # VOLUME indicators
+
+    def chaikin_osc(self, fast_length=3, slow_length=10):
+        fast = self.ema(self.accum_dist(), length=fast_length)
+        slow = self.ema(self.accum_dist(), length=slow_length)
+        return fast - slow
+
+    def accum_dist(self):
+        mf_mult = ((self.close - self.low) - (self.high - self.close)) / (self.high - self.low)
+        mf_volume = mf_mult * self.volume
+
+        return mf_volume.cumsum()
+
+    def obv(self):
+        # calculate on balance volume - leading indicator
+        obv = [self.history.iloc[0]['Volume']]
+
+        for i in range(1, len(self.close)):
+            row = self.history.iloc[i]
+            if row['Close'] > self.history.iloc[i - 1]['Close']:
+                obv.append(obv[-1] + row['Volume'])
+            elif row['Close'] < self.history.iloc[i - 1]['Close']:
+                obv.append(obv[-1] - row['Volume'])
+            else:
+                obv.append(obv[-1])
+
+        return pd.Series(obv)
+
+    def klinger(self, kvo_short_len=34, kvo_long_len=55, sig_len=13, smoothing=0):
+        sv = pd.Series([self.volume.iloc[i] if self.hlc3().diff().iloc[i] > 0
+                        else (self.volume.iloc[i] * -1) for i in range(len(self.volume))])
+
+        kvo = self.ema(sv, length=kvo_short_len) - self.ema(sv, length=kvo_long_len)
+
+        kvo = self.linreg(kvo, length=smoothing) if smoothing > 0 else kvo
+        signal = self.ema(kvo, length=sig_len)
+        hist = kvo - signal
+
+        return kvo, signal, hist
+
+    def vwap(self, anchor='day', length=1):
+        idx = list()
+        vwap = list()
+
+        if length > 1:
+
+            splits = np.array_split(self.history, int(len(self.history) / length))
+
+        else:
+
+            if anchor == 'day':
+                timeframe = [i.day for i in self.date]
+            elif anchor == 'month':
+                timeframe = [i.month for i in self.date]
+            else:
+                timeframe = [i.year for i in self.date]
+
+            change = pd.Series(timeframe).diff()
+
+            for i in range(len(change)):
+                if change[i] != 0:
+                    idx.append(timeframe.index(timeframe[i], idx[-1] if idx else 0))
+
+            splits = np.array_split(self.history, idx)
+
+        for split in splits:
+            price = (split['High'] + split['Low'] + split['Close']) / 3
+            volume = split['Volume']
+            vwap.append((price * volume).cumsum() / volume.cumsum())
+
+        return pd.Series(np.concatenate(vwap))
+
+    def vwma(self, length=20):
+        # volume times price
+        vol_price = self.close * self.volume
+        # rolling weighted average
+        return self.sma(vol_price, length=length) / self.sma(self.volume, length=length)
+
+    # mfi is not complete
+    def mfi(self, length=14):
+        raw_mf = self.hlc3() * self.volume
+        delta = raw_mf.diff()
+
+        u = delta.apply(lambda x: x if x > 0 else 0).rolling(window=length).sum()
+        d = delta.apply(lambda x: x if x < 0 else 0).rolling(window=length).sum()
+
+        # apply EMA to gain and loss
+        avg_gain = self.ema(u, length=length)
+        avg_loss = self.ema(d, length=length).abs()
+
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    # VOLATILITY indicators
+
+    def bb(self, series, length=20, st_dev=2, offset=0):
+        # calculate Bollinger Bands
+        basis = self.sma(series, length=length)
+        # find rolling standard deviation over specified length
+        sd = series.rolling(window=length).std(ddof=0)
+
+        upper_band = basis + (sd * st_dev).shift(offset)
+        lower_band = basis - (sd * st_dev).shift(offset)
+        basis = basis.shift(offset)
+        width = upper_band - lower_band
+
+        return basis, upper_band, lower_band, width
+
+    def chop(self, length=14, signal_length=4, smoothing=0):
+
+        total = self.atr(length=1).rolling(window=length).sum()
+        ll = self.low.rolling(window=length).min()
+        hh = self.high.rolling(window=length).max()
+        diff = hh - ll
+        temp = total / diff
+
+        chop = 100 * np.log10(temp) / np.log10(length)
+
+        chop = self.sma(chop, length=smoothing) if smoothing > 0 else chop
+        signal = self.sma(chop, length=signal_length)
+        hist = chop - signal
+
+        return chop, signal, hist
+
+    def atr(self, length=14):
+        # calculate average true range
+
+        true_range = pd.DataFrame({0: self.high - self.low, 1: abs(self.high - self.close.shift()),
+                                   2: abs(self.low - self.close.shift())}).max(axis=1, skipna=False)
+
+        return self.sma(true_range, length=length)
+
+    def keltner(self, length=20, mult=1):
+
+        basis = self.ema(self.close, length=length)
+        x = self.atr(length=length)
+
+        upper_band = basis + x * mult
+        lower_band = basis - x * mult
+
+        return upper_band, lower_band
