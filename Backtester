@@ -5,11 +5,28 @@ import pandas as pd
 from scipy.signal import find_peaks
 from datetime import timedelta as td
 from Indicators import Indicators
-from OrderTypes import Order_Chain, Stock, Option
+from OrderTypes import Stock, Option
+from math import floor
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
 pd.set_option('display.width', None)
+
+
+def extrema(series, only='', prominence=3):
+
+    peaks, _ = find_peaks(series, prominence=prominence)
+    troughs, _ = find_peaks(-series, prominence=prominence)
+
+    tpl = list()
+
+    if only == '' or 'peaks':
+        tpl.append(peaks)
+    if only == '' or 'troughs':
+        tpl.append(troughs)
+
+    idx = np.sort(np.concatenate(tpl))
+    return pd.Series(series[idx], idx)
 
 
 class Historicals(object):
@@ -41,15 +58,17 @@ class Historicals(object):
 
 class Quant(object):
 
-    def __init__(self, historicals, initial_capital=5000):
+    def __init__(self, historicals, initial_capital=5000, risk_free_rate=0.00307):
 
         self.symbol = historicals.symbol
         self.history = historicals.history
         self.benchmark_returns = historicals.cum_returns
+        self.risk_free_rate = risk_free_rate
+
         self.sigma = historicals.volatility
         self.indicators = Indicators(self.history)
         self.current_row = self.history.iloc[0]
-        self.orders = Order_Chain()
+        self.orders, self.waitlist, self.trades = list(), list(), list()
 
         self.available_funds = initial_capital
         self.shares_owned = 0
@@ -77,15 +96,15 @@ class Quant(object):
                 long = False if shares < 0 else True
                 shares = abs(shares)
             else:
-                shares = int(qty)
+                shares = int(floor(qty))
 
-            order = Stock(self.current_row, qty=shares, long=long, limit=limit, stop=stop, strike=use_strike)
+            order = Stock(self.current_row, qty=int(floor(shares)), long=long, limit=limit, stop=stop, strike=use_strike)
 
             if order.qty != 0 and order.sufficient_funds(self.available_funds):
                 if order.filled:
-                    self.available_funds -= order.value()
-                    self.shares_owned += order.qty if order.long else -order.qty
-                self.orders.add_to_chain(order)
+                    self.add_order(order)
+                else:
+                    self.waitlist.append(order)
 
     def entry_option(self, strike, when=True, fridays_from_now=3, qty=100, is_call=True, write=False, expiration=None):
 
@@ -98,8 +117,30 @@ class Quant(object):
                             qty=qty, is_call=is_call, long=(not write))
 
             if option.sufficient_funds(self.available_funds):
-                self.orders.add_to_chain(option)
-                self.available_funds -= option.value()
+                self.add_order(option)
+
+    def add_order(self, order):
+
+        self.shares_owned += order.qty if order.long else -order.qty
+
+        for prev_order in self.orders:
+
+            if order.long != prev_order.long and type(order) == type(prev_order):
+
+                trade = order.scale_back_position(prev_order)
+
+                if trade:
+                    self.trades.append(trade)
+                    self.available_funds += ((order.value_per_unit_of_qty - prev_order.price) *
+                                             (trade['Qty'] if prev_order.long else -trade['Qty'])) + prev_order.price
+
+            if prev_order.qty == 0:
+                self.orders.remove(prev_order)
+            if order.qty == 0:
+                return
+
+        self.orders.append(order)
+        self.available_funds -= order.value()
 
     def covered_call(self, strike, when=True, fridays_from_now=3, qty=100):
 
@@ -136,7 +177,7 @@ class Quant(object):
 
     def pl_ratio(self, ratio='2:1', target=3, target_as_pct=True):
 
-        chain = self.orders.chain
+        chain = self.orders
         max_idx = len(chain)
         ratio = [float(j) for j in ratio.split(':')]
         ratio = ratio[0] / ratio[1]
@@ -167,39 +208,48 @@ class Quant(object):
             if (criteria1 or criteria2):
                 self.exit(order)
 
+    def portfolio_value(self):
+        total_val = list()
+        for order in self.orders:
+            if isinstance(order, Option) and not order.long:
+                continue
+            total_val.append(order.value())
+        return sum(total_val)
+
     def refresh(self):
 
         current_date = self.current_row['Date']
 
-        for order in self.orders.chain:
+        for order in self.orders:
 
             try:
                 order.calc_premium(self.current_row)
                 if current_date > order.expiration:
-                    self.orders.chain.remove(order)
+                    self.orders.remove(order)
                 elif current_date == order.expiration:
                     self.excercise(order)
-
             except AttributeError:
                 order.value_per_unit_of_qty = self.current_row['Close']
-                if order.fill_order(self.current_row):
-                    self.available_funds -= order.value()
-                    self.shares_owned += order.qty if order.long else -order.qty
+
+        for order in self.waitlist:
+
+            order.value_per_unit_of_qty = self.current_row['Close']
+            if order.fill_order(self.current_row):
+                self.add_order(order)
+                self.waitlist.remove(order)
 
         self.metrics['Shares Owned'].append(self.shares_owned)
         self.metrics['Available Funds'].append(self.available_funds)
-        self.metrics['Balance'].append(self.available_funds + self.orders.portfolio_value())
-        
-        try:
-            self.current_row = self.history.iloc[self.history[self.history == self.current_row].index[0] + 1]
-        except IndexError:
-            pass
+        self.metrics['Balance'].append(self.available_funds + self.portfolio_value())
 
     def run_backtest(self):
+
         for idx in range(len(self.history)):
+
             self.current_row = self.history.iloc[idx]
             self.strategy(idx)
             self.refresh()
+
         return self.performance_analysis()
 
     def strategy(self, idx):
@@ -207,7 +257,7 @@ class Quant(object):
 
     def excercise(self, option):
 
-        self.orders.chain.remove(option)
+        self.orders.remove(option)
         current_close = self.current_row['Close']
 
         long = option.is_call
@@ -229,20 +279,31 @@ class Quant(object):
 
     def performance_analysis(self):
 
-        metrics = pd.DataFrame(self.metrics)
-        balance = metrics['Balance']
+        self.metrics = pd.DataFrame(self.metrics)
+        balance = self.metrics['Balance']
 
-        metrics['Change in Shares Owned'] = metrics['Shares Owned'].diff()
-        metrics['Returns'] = balance.diff()
-        metrics['Pct Change'] = balance.pct_change()
-        metrics['Cumulative Returns'] = metrics['Returns'].cumsum()
-        metrics['Running Pct Change'] = pd.Series([(balance.iloc[i] - balance.iloc[0]) / balance.iloc[0] for i in range(len(balance))])
-        metrics['Drawdown'] = (balance - balance.cummax()) / balance.cummax()
-        metrics['Log Returns'] = np.log(balance).diff()
+        self.metrics['Change in Shares Owned'] = self.metrics['Shares Owned'].diff()
+        self.metrics['Returns'] = balance.diff()
+        self.metrics['Pct Change'] = balance.pct_change()
+        self.metrics['Cumulative Returns'] = self.metrics['Returns'].cumsum()
+        self.metrics['Running Pct Change'] = pd.Series([(balance.iloc[i] - balance.iloc[0]) / balance.iloc[0] for i in range(len(balance))])
+        self.metrics['Drawdown'] = (balance - balance.cummax()) / balance.cummax()
+        self.metrics['Log Returns'] = np.log(balance).diff()
+        returns = self.metrics['Returns']
 
-        trades = self.orders.calc_postrun_trade_stats()
-        winners = trades[trades['Profit'] > 0]['Profit']
-        losers = trades[trades['Profit'] <= 0]['Profit']
+        self.trades = pd.DataFrame(self.trades, columns=['Type', 'Position', 'Option', 'Expiration', 'Open',
+                                                         'Close', 'Qty', 'Open Date', 'Close Date', 'Days Held'])
+
+        self.trades['Profit'] = np.where(self.trades['Position'] == 'Long',
+                                         (self.trades['Close'] - self.trades['Open']) * self.trades['Qty'],
+                                         (self.trades['Close'] - self.trades['Open']) * -self.trades['Qty'])
+
+        self.trades['% G/L'] = self.trades['Profit'] / (self.trades['Open'] * self.trades['Qty'])
+
+        winners = self.trades[self.trades['Profit'] > 0]['Profit']
+        losers = self.trades[self.trades['Profit'] <= 0]['Profit']
+        winners_pct = self.trades[self.trades['Profit'] > 0]['% G/L']
+        losers_pct = self.trades[self.trades['Profit'] <= 0]['% G/L']
 
         gross_profit = winners.sum()
         gross_loss = losers.sum()
@@ -254,31 +315,46 @@ class Quant(object):
             profit_factor = np.NaN
 
         try:
-            avg_days_held = round(trades['Days Held'].mean())
+            avg_days_held = round(self.trades['Days Held'].mean())
         except ValueError:
             avg_days_held = np.NaN
 
         if nbr_of_trades != 0:
-            win_rate = round(winners.count() / nbr_of_trades * 100)
+            win_rate = round(winners.count() / nbr_of_trades)
         else:
             win_rate = np.NaN
 
-        # sharpe = self.returns.mean() / self.returns.std()
-        # sortino = self.returns.mean() / np.sqrt(self.returns.apply(lambda x: x ** 2 if x < 0 else 0)).mean()
+        avg_win = winners.mean()
+        avg_loss = losers.mean()
 
-        performance = pd.DataFrame({'Gross Profit': gross_profit, 'Gross Loss': gross_loss,
-                                    'Net PnL': gross_profit + gross_loss, 'Profit Factor': profit_factor,
-                                    '% Growth': metrics['Running Pct Change'].iloc[-1],
-                                    'Maximum Drawdown (%)': metrics['Drawdown'].min() * 100,
-                                    'Average Days Held': avg_days_held, 'Total Closed Trades': nbr_of_trades,
-                                    'Win Rate (%)': win_rate, '# of Winning Trades': winners.count(),
-                                    '# of Losing Trades': winners.count(), 'Average Win': winners.mean(),
-                                    'Largest Win': winners.max(), 'Average Loss': losers.mean(),
-                                    'Largest Loss': losers.min()}, index=[0])
+        sortino = (returns.mean() - self.risk_free_rate) / np.sqrt(returns.apply(lambda x: x ** 2 if x < 0 else 0)).mean()
 
-        return metrics, performance, trades
+        performance = pd.DataFrame({'Gross Profit': gross_profit,
+                                    'Gross Loss': gross_loss,
+                                    'Net PnL': gross_profit + gross_loss,
+                                    'Profit Factor': profit_factor,
+                                    'Sharpe': (returns.mean() - self.risk_free_rate) / returns.std(),
+                                    'Sortino': sortino,
+                                    'Expectancy': (win_rate * avg_win) + ((1 - win_rate) * avg_loss),
+                                    '% Growth': self.metrics['Running Pct Change'].iloc[-1],
+                                    'Maximum Drawdown (%)': self.metrics['Drawdown'].min() * 100,
+                                    'Average Days Held': avg_days_held,
+                                    'Total Closed Trades': nbr_of_trades,
+                                    'Win Rate (%)': win_rate * 100,
+                                    '# of Winning Trades': winners.count(),
+                                    '# of Losing Trades': winners.count(),
+                                    'Average Win': avg_win,
+                                    'Largest Win': winners.max(),
+                                    'Average Win (%)': winners_pct.mean(),
+                                    'Largest Win (%)': winners_pct.max(),
+                                    'Average Loss': losers.mean(),
+                                    'Largest Loss': losers.min(),
+                                    'Average Loss (%)': avg_loss,
+                                    'Largest Loss (%)': losers_pct.max()}, index=[0])
 
-    def show_charts(self):
+        return self.metrics, performance, self.trades
+
+    def plot_charts(self):
 
         fig, (ax1a, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(14, 7.5))
 
@@ -304,5 +380,6 @@ class Quant(object):
         ax4.plot(self.metrics['Available Funds'], color='darkgreen')
         ax4.set_title('Available Funds')
 
+        fig.canvas.set_window_title(self.__class__.__name__)
         plt.tight_layout()
-        plt.show()
+        # plt.show()
